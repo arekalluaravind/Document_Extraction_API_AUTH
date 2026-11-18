@@ -1,0 +1,22 @@
+
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+
+# Agentic workflow
+langgraph
+openai
+
+# PDF processing and OCR
+pdfplumber
+pytesseract
+pdf2image
+pypdf
+
+# Excel processing
+pandas
+openpyxl
+
+# AWS Textract
+boto3
