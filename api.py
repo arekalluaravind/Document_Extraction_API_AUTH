@@ -272,13 +272,7 @@ async def extract_document(
         if len(content) > MAX_FILE_SIZE:
             raise HTTPException(
                 status_code=413,
-                detail="Maximum PDF size is 25 MB."
-            )
-
-        if not content.startswith(b"%PDF-"):
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid PDF file."
+                detail="Maximum file size is 25 MB."
             )
 
     finally:
