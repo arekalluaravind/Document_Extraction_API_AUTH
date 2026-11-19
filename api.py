@@ -260,12 +260,6 @@ async def extract_document(
             detail="Choose agentic or nonagentic."
         )
 
-    if Path(original_filename).suffix.lower() != ".pdf":
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF files are supported."
-        )
-
     try:
         content = await file.read()
 
