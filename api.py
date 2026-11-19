@@ -3,12 +3,9 @@ import logging
 import uuid
 import os
 import secrets
-import threading
 
 from pathlib import Path
 from typing import Optional
-from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 
@@ -25,6 +22,7 @@ from fastapi import (
     Depends,
 )
 from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
 
 from graph_workflow_updated import create_document_router_graph
 from main_updated import save_result_to_excel
@@ -47,12 +45,6 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Background job configuration
-executor = ThreadPoolExecutor(max_workers=2)
-
-jobs = {}
-jobs_lock = threading.Lock()
-
 
 # --------------------------------------------------
 # 2. API KEY AUTHENTICATION
@@ -63,8 +55,6 @@ async def verify_api_key(
 ):
 
     if not API_KEY:
-        logger.error("API_KEY is not configured")
-
         raise HTTPException(
             status_code=503,
             detail="API authentication is not configured."
@@ -92,11 +82,10 @@ async def verify_api_key(
 app = FastAPI(
     title="Document Extractor API",
     description=(
-        "Upload a PDF and choose either agentic LangGraph "
-        "extraction or non-agentic AWS Textract extraction. "
-        "Supports asynchronous background processing."
+        "Upload a PDF and receive complete invoice extraction data. "
+        "Download the generated Excel file using the job ID."
     ),
-    version="3.0.0",
+    version="4.0.0",
 )
 
 
@@ -214,93 +203,7 @@ def process_nonagentic_document(
 
 
 # --------------------------------------------------
-# 6. BACKGROUND JOB PROCESSOR
-# --------------------------------------------------
-
-def process_document_in_background(
-    job_id: str,
-    pdf_path: Path,
-    extraction_mode: str,
-    user_query: Optional[str] = None,
-):
-
-    logger.info(
-        "Background processing started for job %s",
-        job_id,
-    )
-
-    with jobs_lock:
-        jobs[job_id]["status"] = "processing"
-        jobs[job_id]["started_at"] = datetime.now(
-            timezone.utc
-        ).isoformat()
-
-    try:
-
-        if extraction_mode == "agentic":
-
-            logger.info(
-                "Job %s routed to AGENTIC workflow",
-                job_id,
-            )
-
-            result = process_agentic_document(
-                pdf_path,
-                job_id,
-                user_query,
-            )
-
-        else:
-
-            logger.info(
-                "Job %s routed to NON-AGENTIC workflow",
-                job_id,
-            )
-
-            result = process_nonagentic_document(
-                pdf_path,
-                job_id,
-            )
-
-        with jobs_lock:
-            jobs[job_id].update({
-                "status": "completed",
-                "document_type": result["document_type"],
-                "extraction_method": result["extraction_method"],
-                "extracted_data": result["extracted_data"],
-                "excel_file": result["excel_file"],
-                "completed_at": datetime.now(
-                    timezone.utc
-                ).isoformat(),
-            })
-
-        logger.info(
-            "Job %s completed successfully",
-            job_id,
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Background processing failed for job %s",
-            job_id,
-        )
-
-        with jobs_lock:
-            jobs[job_id].update({
-                "status": "failed",
-                "error": (
-                    "Document processing failed. "
-                    "Check the API logs."
-                ),
-                "completed_at": datetime.now(
-                    timezone.utc
-                ).isoformat(),
-            })
-
-
-# --------------------------------------------------
-# 7. API HOMEPAGE (PUBLIC)
+# 6. API HOMEPAGE
 # --------------------------------------------------
 
 @app.get("/")
@@ -319,7 +222,7 @@ def root():
 
 
 # --------------------------------------------------
-# 8. HEALTH CHECK (PUBLIC)
+# 7. HEALTH CHECK
 # --------------------------------------------------
 
 @app.get("/health")
@@ -331,10 +234,10 @@ def health():
 
 
 # --------------------------------------------------
-# 9. ASYNCHRONOUS DOCUMENT EXTRACTION
+# 8. API 1 - INVOICE EXTRACTION
 # --------------------------------------------------
 
-@app.post("/api/v1/documents/extract", status_code=202)
+@app.post("/api/v1/documents/extract")
 async def extract_document(
     file: UploadFile = File(...),
 
@@ -351,162 +254,106 @@ async def extract_document(
 
     extraction_mode = extraction_mode.strip().lower()
 
-    # Validate extraction mode
     if extraction_mode not in ["agentic", "nonagentic"]:
-
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Invalid extraction_mode. "
-                "Choose agentic or nonagentic."
-            ),
+            detail="Choose agentic or nonagentic."
         )
 
-    # Validate file extension
     if Path(original_filename).suffix.lower() != ".pdf":
-
         raise HTTPException(
             status_code=400,
-            detail="Only PDF files are supported.",
+            detail="Only PDF files are supported."
         )
 
     try:
-
         content = await file.read()
 
         if not content:
             raise HTTPException(
                 status_code=400,
-                detail="The uploaded file is empty.",
+                detail="Uploaded file is empty."
             )
 
         if len(content) > MAX_FILE_SIZE:
             raise HTTPException(
                 status_code=413,
-                detail="Maximum PDF size is 25 MB.",
+                detail="Maximum PDF size is 25 MB."
             )
 
         if not content.startswith(b"%PDF-"):
             raise HTTPException(
                 status_code=400,
-                detail="The uploaded file is not a valid PDF.",
+                detail="Invalid PDF file."
             )
 
     finally:
         await file.close()
 
-    # Generate job ID
     job_id = uuid.uuid4().hex
 
     pdf_path = INPUT_DIR / f"{job_id}.pdf"
 
     pdf_path.write_bytes(content)
 
-    # Initialize job
-    with jobs_lock:
-
-        jobs[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "extraction_mode": extraction_mode,
-            "original_filename": original_filename,
-            "created_at": datetime.now(
-                timezone.utc
-            ).isoformat(),
-        }
+    logger.info(
+        "Starting extraction for job %s",
+        job_id
+    )
 
     try:
 
-        # Submit extraction to background executor
-        executor.submit(
-            process_document_in_background,
-            job_id,
-            pdf_path,
-            extraction_mode,
-            user_query,
+        if extraction_mode == "agentic":
+
+            result = await run_in_threadpool(
+                process_agentic_document,
+                pdf_path,
+                job_id,
+                user_query,
+            )
+
+        else:
+
+            result = await run_in_threadpool(
+                process_nonagentic_document,
+                pdf_path,
+                job_id,
+            )
+
+        logger.info(
+            "Extraction completed for job %s",
+            job_id
         )
+
+        return {
+            "status": "success",
+            "message": "Invoice extracted successfully.",
+            "job_id": job_id,
+            "extraction_mode": extraction_mode,
+            "document_type": result["document_type"],
+            "extraction_method": result["extraction_method"],
+            "extracted_data": result["extracted_data"],
+            "excel_file": result["excel_file"],
+            "download_url": (
+                f"/api/v1/documents/{job_id}/download"
+            ),
+        }
 
     except Exception as exc:
 
         logger.exception(
-            "Unable to submit background job %s",
-            job_id,
+            "Extraction failed for job %s",
+            job_id
         )
-
-        with jobs_lock:
-            jobs[job_id]["status"] = "failed"
-            jobs[job_id]["error"] = "Unable to start processing."
 
         raise HTTPException(
             status_code=500,
-            detail="Unable to start document processing.",
+            detail=f"Document extraction failed: {str(exc)}"
         ) from exc
 
-    logger.info(
-        "Job %s accepted for background processing",
-        job_id,
-    )
-
-    # Return immediately without waiting for extraction
-    return {
-        "status": "accepted",
-        "message": "Document uploaded successfully. Processing started.",
-        "job_id": job_id,
-        "extraction_mode": extraction_mode,
-        "status_url": (
-            f"/api/v1/documents/{job_id}/status"
-        ),
-        "download_url": (
-            f"/api/v1/documents/{job_id}/download"
-        ),
-    }
-
 
 # --------------------------------------------------
-# 10. JOB STATUS ENDPOINT
-# --------------------------------------------------
-
-@app.get("/api/v1/documents/{job_id}/status")
-def get_job_status(
-    job_id: str,
-
-    authenticated: bool = Depends(verify_api_key),
-):
-
-    try:
-        safe_job_id = uuid.UUID(hex=job_id).hex
-
-    except (ValueError, AttributeError):
-
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid job ID.",
-        )
-
-    with jobs_lock:
-
-        job = jobs.get(safe_job_id)
-
-        if job is None:
-
-            raise HTTPException(
-                status_code=404,
-                detail="Job not found.",
-            )
-
-        response = dict(job)
-
-    if response["status"] == "completed":
-
-        response["download_url"] = (
-            f"/api/v1/documents/{safe_job_id}/download"
-        )
-
-    return response
-
-
-# --------------------------------------------------
-# 11. EXCEL DOWNLOAD ENDPOINT
+# 9. API 2 - EXCEL DOWNLOAD
 # --------------------------------------------------
 
 @app.get("/api/v1/documents/{job_id}/download")
@@ -517,48 +364,30 @@ def download_excel(
 ):
 
     try:
-
         safe_job_id = uuid.UUID(hex=job_id).hex
 
     except (ValueError, AttributeError):
-
         raise HTTPException(
             status_code=400,
-            detail="Invalid job ID.",
+            detail="Invalid job ID."
         )
 
-    with jobs_lock:
-
-        job = jobs.get(safe_job_id)
-
-        if job is None:
-
-            raise HTTPException(
-                status_code=404,
-                detail="Job not found.",
-            )
-
-        if job["status"] != "completed":
-
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Document processing is not completed yet. "
-                    "Check the job status endpoint."
-                ),
-            )
-
     output_folder = OUTPUT_DIR / safe_job_id
+
+    if not output_folder.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Excel file not found for this job."
+        )
 
     excel_files = list(
         output_folder.rglob("*.xlsx")
     )
 
     if not excel_files:
-
         raise HTTPException(
             status_code=404,
-            detail="Excel file was not found for this job.",
+            detail="Excel file was not found."
         )
 
     excel_path = excel_files[0]
