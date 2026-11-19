@@ -1,531 +1,232 @@
-
-import logging
-import uuid
 import os
-import secrets
+import io
+import pandas as pd
+from pypdf import PdfReader, PdfWriter
+from pdf2image import convert_from_path
+import boto3
 
-from io import BytesIO
-from pathlib import Path
-from typing import Optional
-
-from dotenv import load_dotenv
-from PIL import Image, ImageSequence, ImageOps
-
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
-
-from fastapi import (
-    FastAPI,
-    File,
-    Form,
-    HTTPException,
-    UploadFile,
-    Header,
-    Depends,
-)
-
-from fastapi.responses import FileResponse
-from starlette.concurrency import run_in_threadpool
-
-from graph_workflow_updated import create_document_router_graph
-from main_updated import save_result_to_excel
+# Initialize the Textract client
+textract_client = boto3.client('textract', region_name='ap-southeast-2')  # Change to your AWS region
 
 
-# --------------------------------------------------
-# CONFIGURATION
-# --------------------------------------------------
+def is_valid_invoice_field(key, val):
+    """Filters out noise, empty values, line items, and footers, keeping only valid invoice metadata."""
+    if not val or val.lower() == 'none' or val.strip() == '':
+        return False
 
-API_KEY = os.getenv("API_KEY")
+    key_upper = key.upper()
 
-INPUT_DIR = BASE_DIR / "input_documents"
-OUTPUT_DIR = BASE_DIR / "output_results"
+    # Define allowed keywords that belong to invoice headers/summary sections
+    allowed_keywords = [
+        'INVOICE', 'P.O.', 'PO NUMBER', 'DATE', 'TERM',
+        'SALESPERSON', 'TO', 'SHIP', 'SUBTOTAL', 'TAX',
+        'TOTAL', 'SHIPPING', 'DUE', 'BALANCE'
+    ]
 
-MAX_FILE_SIZE = 25 * 1024 * 1024
+    has_keyword = any(kw in key_upper for kw in allowed_keywords)
+    is_short_header = len(key_upper) <= 35
 
-ALLOWED_EXTENSIONS = {
-    ".pdf",
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".tif",
-    ".tiff",
-    ".webp",
-}
-
-INPUT_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+    return has_keyword and is_short_header
 
 
-# --------------------------------------------------
-# API KEY AUTHENTICATION
-# --------------------------------------------------
+def extract_form_fields(page_bytes):
+    """Extracts and filters key-value form fields using analyze_document."""
+    response = textract_client.analyze_document(
+        Document={'Bytes': page_bytes},
+        FeatureTypes=['FORMS']
+    )
 
-async def verify_api_key(
-    x_api_key: Optional[str] = Header(default=None)
-):
-    if not API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="API authentication is not configured."
-        )
+    blocks = response.get('Blocks', [])
+    block_map = {block['Id']: block for block in blocks}
+    form_fields = {}
 
-    if not x_api_key:
-        raise HTTPException(
-            status_code=401,
-            detail="API Key is required."
-        )
+    for block in blocks:
+        if block['BlockType'] == 'KEY_VALUE_SET' and 'KEY' in block['EntityTypes']:
+            key_text = ""
+            if 'Relationships' in block:
+                for rel in block['Relationships']:
+                    if rel['Type'] == 'CHILD':
+                        for cid in rel['Ids']:
+                            if block_map[cid]['BlockType'] == 'WORD':
+                                key_text += block_map[cid]['Text'] + " "
 
-    if not secrets.compare_digest(x_api_key, API_KEY):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid API Key."
-        )
+            val_text = ""
+            if 'Relationships' in block:
+                for rel in block['Relationships']:
+                    if rel['Type'] == 'VALUE':
+                        for vid in rel['Ids']:
+                            val_block = block_map[vid]
+                            if 'Relationships' in val_block:
+                                for v_rel in val_block['Relationships']:
+                                    if v_rel['Type'] == 'CHILD':
+                                        for child_id in v_rel['Ids']:
+                                            if block_map[child_id]['BlockType'] == 'WORD':
+                                                val_text += block_map[child_id]['Text'] + " "
 
-    return True
+            clean_key = key_text.strip()
+            clean_val = val_text.strip()
+
+            if is_valid_invoice_field(clean_key, clean_val):
+                form_fields[clean_key] = clean_val
+
+    return form_fields
 
 
-# --------------------------------------------------
-# FASTAPI APPLICATION
-# --------------------------------------------------
+def extract_tabular_data(page_bytes):
+    """Extracts line items / tabular data using analyze_expense."""
+    response = textract_client.analyze_expense(
+        Document={'Bytes': page_bytes}
+    )
 
-app = FastAPI(
-    title="Document Extractor API",
-    description="API for extracting information from PDF and image documents.",
-    version="5.0.0"
-)
+    line_items = []
+    for expense_doc in response.get('ExpenseDocuments', []):
+        for item_group in expense_doc.get('LineItemGroups', []):
+            for line_item in item_group.get('LineItems', []):
+                row_data = {}
+                for expense_field in line_item.get('LineItemExpenseFields', []):
+                    col_type = expense_field.get('Type', {}).get('Text', 'UNKNOWN')
+                    col_value = expense_field.get('ValueDetection', {}).get('Text', '')
+                    row_data[col_type] = col_value
+                line_items.append(row_data)
+
+    return line_items
 
 
-# --------------------------------------------------
-# IMAGE TO PDF CONVERSION
-# --------------------------------------------------
-
-def convert_image_to_pdf(content: bytes, output_path: Path):
-
+def is_pdf_selectable(file_path):
+    """Determines whether a PDF contains selectable digital text or is scanned."""
     try:
-        frames = []
-
-        with Image.open(BytesIO(content)) as image:
-
-            for frame in ImageSequence.Iterator(image):
-
-                # Correct image orientation
-                frame = ImageOps.exif_transpose(frame.copy())
-
-                # Handle transparent images with a white background
-                if frame.mode in ("RGBA", "LA") or (
-                    frame.mode == "P" and "transparency" in frame.info
-                ):
-                    rgba = frame.convert("RGBA")
-                    background = Image.new(
-                        "RGBA",
-                        rgba.size,
-                        (255, 255, 255, 255)
-                    )
-                    frame = Image.alpha_composite(
-                        background,
-                        rgba
-                    ).convert("RGB")
-                else:
-                    frame = frame.convert("RGB")
-
-                frames.append(frame.copy())
-
-        if not frames:
-            raise ValueError("No valid image pages found.")
-
-        # Convert image frames into a PDF
-        frames[0].save(
-            output_path,
-            format="PDF",
-            save_all=True,
-            append_images=frames[1:]
-        )
-
-        # Verify generated PDF
-        if not output_path.exists():
-            raise ValueError("PDF file was not generated.")
-
-        if not output_path.read_bytes().startswith(b"%PDF-"):
-            raise ValueError("Generated file is not a valid PDF.")
-
-        logger.info("Image successfully converted to PDF: %s", output_path)
-
-    except Exception as exc:
-        logger.exception("Image to PDF conversion failed")
-
-        raise ValueError(
-            f"Unable to convert image to PDF: {str(exc)}"
-        ) from exc
-
-
-# --------------------------------------------------
-# AGENTIC DOCUMENT PROCESSING
-# --------------------------------------------------
-
-def process_agentic_document(
-    pdf_path: Path,
-    job_id: str,
-    user_query: Optional[str] = None
-):
-
-    logger.info("Starting AGENTIC extraction")
-
-    graph = create_document_router_graph()
-
-    initial_state = {
-        "pdf_path": str(pdf_path),
-        "user_query": user_query,
-        "extracted_text": "",
-        "extraction_method": "",
-        "uploaded_file": None,
-        "document_type": None,
-        "extracted_data": None,
-    }
-
-    result = graph.invoke(initial_state)
-
-    extracted_data = result.get("extracted_data")
-
-    if extracted_data is None:
-        raise ValueError(
-            "Agentic workflow returned no structured data."
-        )
-
-    output_folder = OUTPUT_DIR / job_id
-    output_folder.mkdir(parents=True, exist_ok=True)
-
-    save_result_to_excel(
-        extracted_data=extracted_data,
-        output_dir=str(output_folder),
-        base_filename=pdf_path.stem
-    )
-
-    excel_path = output_folder / f"{pdf_path.stem}_extracted.xlsx"
-
-    if not excel_path.is_file():
-        raise FileNotFoundError(
-            "Agentic Excel output was not created."
-        )
-
-    return {
-        "document_type": result.get("document_type"),
-        "extraction_method": result.get("extraction_method"),
-        "extracted_data": extracted_data.model_dump(),
-        "excel_file": excel_path.name,
-    }
-
-
-# --------------------------------------------------
-# NON-AGENTIC AWS TEXTRACT PROCESSING
-# --------------------------------------------------
-
-def process_nonagentic_document(
-    pdf_path: Path,
-    job_id: str
-):
-
-    logger.info("Starting NON-AGENTIC AWS Textract extraction")
-
-    from AwsTextract_Hybrid import (
-        process_file,
-        save_invoice_to_excel
-    )
-
-    textract_result = process_file(str(pdf_path))
-
-    if not textract_result:
-        raise ValueError(
-            "AWS Textract returned no extraction result."
-        )
-
-    output_folder = OUTPUT_DIR / job_id
-    output_folder.mkdir(parents=True, exist_ok=True)
-
-    save_invoice_to_excel(
-        filename=pdf_path.name,
-        result=textract_result,
-        output_folder_path=str(output_folder)
-    )
-
-    excel_path = (
-        output_folder
-        / pdf_path.stem
-        / "extracted_invoice_data.xlsx"
-    )
-
-    if not excel_path.is_file():
-        raise FileNotFoundError(
-            "AWS Textract Excel output was not created."
-        )
-
-    return {
-        "document_type": "INVOICE",
-        "extraction_method": "AWS_TEXTRACT",
-        "extracted_data": textract_result,
-        "excel_file": excel_path.name,
-    }
-
-
-# --------------------------------------------------
-# ROOT ENDPOINT
-# --------------------------------------------------
-
-@app.get("/")
-async def root():
-
-    return {
-        "message": "Document Extractor API is running",
-        "version": "5.0.0",
-        "supported_files": list(ALLOWED_EXTENSIONS),
-        "extraction_modes": [
-            "agentic",
-            "nonagentic"
-        ],
-        "endpoints": {
-            "health": "/health",
-            "extract": "/api/v1/documents/extract",
-            "download": "/api/v1/documents/{job_id}/download",
-            "docs": "/docs"
-        },
-        "authentication": "X-API-Key required for extraction and download"
-    }
-
-
-# --------------------------------------------------
-# HEALTH CHECK
-# --------------------------------------------------
-
-@app.get("/health")
-async def health():
-
-    return {
-        "status": "healthy",
-        "message": "Document Extractor API is running"
-    }
-
-
-# --------------------------------------------------
-# DOCUMENT EXTRACTION ENDPOINT
-# --------------------------------------------------
-
-@app.post("/api/v1/documents/extract")
-async def extract_document(
-
-    file: UploadFile = File(...),
-
-    extraction_mode: str = Form(...),
-
-    user_query: Optional[str] = Form(default=None),
-
-    authenticated: bool = Depends(verify_api_key),
-
-):
-
-    original_filename = Path(
-        file.filename or "document"
-    ).name
-
-    file_extension = Path(
-        original_filename
-    ).suffix.lower()
-
-    # Validate file extension
-    if file_extension not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Unsupported file format. "
-                "Allowed formats: PDF, JPG, JPEG, PNG, TIFF, WEBP."
-            )
-        )
-
-    # Validate extraction mode
-    extraction_mode = extraction_mode.strip().lower()
-
-    if extraction_mode not in ["agentic", "nonagentic"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Choose agentic or nonagentic."
-        )
-
-    # Read uploaded file
-    try:
-        content = await file.read()
-
-        if not content:
-            raise HTTPException(
-                status_code=400,
-                detail="Uploaded file is empty."
-            )
-
-        if len(content) > MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=413,
-                detail="Maximum file size is 25 MB."
-            )
-
-    finally:
-        await file.close()
-
-    # Create unique job ID
-    job_id = uuid.uuid4().hex
-
-    # All input files are normalized to PDF
-    pdf_path = INPUT_DIR / f"{job_id}.pdf"
-
-    try:
-
-        # ------------------------------------------
-        # PDF FILE
-        # ------------------------------------------
-
-        if file_extension == ".pdf":
-
-            if not content.startswith(b"%PDF-"):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Uploaded file is not a valid PDF."
-                )
-
-            pdf_path.write_bytes(content)
-
-            logger.info(
-                "PDF uploaded successfully: %s",
-                original_filename
-            )
-
-        # ------------------------------------------
-        # IMAGE FILE
-        # ------------------------------------------
-
+        reader = PdfReader(file_path)
+        total_text = ""
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                total_text += text.strip()
+        # If text length is substantial, it's digital/selectable. Otherwise, it's scanned.
+        return len(total_text) > 50
+    except Exception:
+        return False
+
+
+def process_file(local_path):
+    """Handles selectable PDFs, scanned PDFs, and standalone images."""
+    combined_forms = {}
+    combined_line_items = []
+
+    file_extension = os.path.splitext(local_path)[1].lower()
+
+    if file_extension == '.pdf':
+        # Check if the PDF is selectable or scanned
+        selectable = is_pdf_selectable(local_path)
+
+        if selectable:
+            print(" -> PDF Type: Selectable (Digital text found)")
+            reader = PdfReader(local_path)
+            total_pages = len(reader.pages)
+            print(f"Processing selectable PDF with {total_pages} page(s)...")
+
+            for index, page in enumerate(reader.pages):
+                print(f"   -> Processing page {index + 1} of {total_pages}...")
+                writer = PdfWriter()
+                writer.add_page(page)
+                byte_stream = io.BytesIO()
+                writer.write(byte_stream)
+                page_bytes = byte_stream.getvalue()
+
+                page_forms = extract_form_fields(page_bytes)
+                page_items = extract_tabular_data(page_bytes)
+
+                combined_forms.update(page_forms)
+                combined_line_items.extend(page_items)
         else:
+            print(" -> PDF Type: Scanned (Converting pages to images via pdf2image)")
+            # Convert scanned PDF pages to high-res PIL Images
+            images = convert_from_path(local_path, dpi=200)
+            total_pages = len(images)
+            print(f"Processing scanned PDF with {total_pages} page(s)...")
 
-            convert_image_to_pdf(
-                content,
-                pdf_path
-            )
+            for index, pil_image in enumerate(images):
+                print(f"   -> Processing page image {index + 1} of {total_pages}...")
+                byte_stream = io.BytesIO()
+                pil_image.save(byte_stream, format='PNG')
+                page_bytes = byte_stream.getvalue()
 
-            logger.info(
-                "Image converted to PDF: %s",
-                original_filename
-            )
+                page_forms = extract_form_fields(page_bytes)
+                page_items = extract_tabular_data(page_bytes)
 
-        # ------------------------------------------
-        # EXTRACTION
-        # ------------------------------------------
+                combined_forms.update(page_forms)
+                combined_line_items.extend(page_items)
 
-        logger.info(
-            "Starting extraction. Job ID: %s, Mode: %s",
-            job_id,
-            extraction_mode
-        )
+    elif file_extension in ['.png', '.jpg', '.jpeg']:
+        print(" -> File Type: Image")
+        with open(local_path, 'rb') as f:
+            page_bytes = f.read()
 
-        if extraction_mode == "agentic":
+        combined_forms = extract_form_fields(page_bytes)
+        combined_line_items = extract_tabular_data(page_bytes)
 
-            result = await run_in_threadpool(
-                process_agentic_document,
-                pdf_path,
-                job_id,
-                user_query
-            )
-
-        else:
-
-            result = await run_in_threadpool(
-                process_nonagentic_document,
-                pdf_path,
-                job_id
-            )
-
-        logger.info(
-            "Extraction completed successfully. Job ID: %s",
-            job_id
-        )
-
-        return {
-            "status": "success",
-            "message": "Document extracted successfully.",
-            "job_id": job_id,
-            "original_filename": original_filename,
-            "file_type": file_extension.replace(".", ""),
-            "extraction_mode": extraction_mode,
-            "document_type": result["document_type"],
-            "extraction_method": result["extraction_method"],
-            "extracted_data": result["extracted_data"],
-            "excel_file": result["excel_file"],
-            "download_url": (
-                f"/api/v1/documents/{job_id}/download"
-            ),
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as exc:
-
-        logger.exception(
-            "Extraction failed for job %s",
-            job_id
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Document extraction failed: {str(exc)}"
-        ) from exc
+    return {
+        "FormFields": combined_forms,
+        "LineItems": combined_line_items
+    }
 
 
-# --------------------------------------------------
-# DOWNLOAD EXCEL ENDPOINT
-# --------------------------------------------------
+def save_invoice_to_excel(filename, result, output_folder_path):
+    """Creates a folder named after the file inside output_folder_path and saves the excel file."""
+    file_base_name = os.path.splitext(filename)[0]
+    file_output_dir = os.path.join(output_folder_path, file_base_name)
+    os.makedirs(file_output_dir, exist_ok=True)
 
-@app.get("/api/v1/documents/{job_id}/download")
-async def download_excel(
+    excel_path = os.path.join(file_output_dir, "extracted_invoice_data.xlsx")
 
-    job_id: str,
+    form_records = [{"File Name": filename, **result["FormFields"]}]
+    line_item_records = [{"File Name": filename, **item} for item in result["LineItems"]]
 
-    authenticated: bool = Depends(verify_api_key),
+    df_forms = pd.DataFrame(form_records)
+    df_items = pd.DataFrame(line_item_records)
 
-):
+    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+        df_forms.to_excel(writer, sheet_name='Header Form Fields', index=False)
+        df_items.to_excel(writer, sheet_name='Tabular Line Items', index=False)
 
-    # Validate job ID
-    try:
-        valid_job_id = uuid.UUID(hex=job_id).hex
+    print(f"Successfully saved Excel file inside folder: '{file_output_dir}'")
 
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid job ID."
-        )
 
-    output_folder = OUTPUT_DIR / valid_job_id
+def main(input_path, output_folder_path):
+    """Main function taking input file/directory path and output folder path."""
+    if not os.path.exists(input_path):
+        print(f"Input path '{input_path}' does not exist.")
+        return
 
-    if not output_folder.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Document job not found."
-        )
+    os.makedirs(output_folder_path, exist_ok=True)
 
-    # Find generated Excel file
-    excel_files = list(
-        output_folder.rglob("*.xlsx")
-    )
+    files_to_process = []
+    if os.path.isfile(input_path):
+        files_to_process = [input_path]
+    elif os.path.isdir(input_path):
+        files_to_process = [
+            os.path.join(input_path, f) for f in os.listdir(input_path)
+            if f.lower().endswith(('.pdf', '.png', '.jpg', '.jpeg'))
+        ]
 
-    if not excel_files:
-        raise HTTPException(
-            status_code=404,
-            detail="Excel file not found."
-        )
+    if not files_to_process:
+        print("No valid invoice files found to process.")
+        return
 
-    excel_path = excel_files[0]
+    for file_path in files_to_process:
+        filename = os.path.basename(file_path)
+        print(f"\n==========================================")
+        print(f"Processing File: {filename}")
+        print(f"==========================================")
 
-    return FileResponse(
-        path=excel_path,
-        filename=excel_path.name,
-        media_type=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        )
-    )
+        try:
+            result = process_file(file_path)
+            save_invoice_to_excel(filename, result, output_folder_path)
+        except Exception as e:
+            print(f"Error processing {filename}: {str(e)}")
+
+
+if __name__ == "__main__":
+    INPUT_PATH = './invoices'
+    OUTPUT_FOLDER = './output_results'
+
+    main(INPUT_PATH, OUTPUT_FOLDER)
